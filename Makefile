@@ -1,7 +1,7 @@
 # Build into bin/ (gitignored) so the binary never collides with the xueqiu/
 # source package at the repo root.
-BINARY  := bin/xueqiu
-PKG     := ./cmd/xueqiu
+BINARY  := bin/xue
+PKG     := ./cmd/xue
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
