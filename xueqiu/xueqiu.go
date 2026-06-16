@@ -1,90 +1,358 @@
 // Package xueqiu is the library behind the xue command line:
-// the HTTP client, request shaping, and the typed data models for xueqiu.
+// the HTTP client, session management, and typed data models for Xueqiu APIs.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Xueqiu (xueqiu.com) requires a session cookie that is obtained automatically
+// by visiting the site home page before making API calls. No account or login is
+// required. The client paces requests, retries transient errors, and handles the
+// double-JSON encoding Xueqiu uses for timeline items.
 package xueqiu
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/http/cookiejar"
+	"net/url"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to xueqiu. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to Xueqiu servers.
 const DefaultUserAgent = "xue/dev (+https://github.com/tamnd/xueqiu-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at xueqiu.com; change it once you
-// know the real endpoints you want to read.
+// Host is the primary hostname the URI driver claims.
 const Host = "xueqiu.com"
 
-// BaseURL is the root every request is built from.
+// BaseURL is the root URL for xueqiu.com.
 const BaseURL = "https://" + Host
 
-// Client talks to xueqiu over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+// ErrNotFound is returned when the API returns no results for a symbol.
+var ErrNotFound = errors.New("not found")
 
-	last time.Time
+// Config holds HTTP client parameters.
+type Config struct {
+	UserAgent  string
+	Rate       time.Duration
+	Retries    int
+	Timeout    time.Duration
+	XueqiuBase string // overridable for tests
+	StockBase  string // overridable for tests
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns sensible defaults for Xueqiu APIs.
+func DefaultConfig() Config {
+	return Config{
+		UserAgent:  DefaultUserAgent,
+		Rate:       300 * time.Millisecond,
+		Retries:    3,
+		Timeout:    30 * time.Second,
+		XueqiuBase: "https://xueqiu.com",
+		StockBase:  "https://stock.xueqiu.com",
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client is a rate-limited HTTP client for Xueqiu public APIs.
+type Client struct {
+	cfg        Config
+	http       *http.Client
+	jar        http.CookieJar
+	mu         sync.Mutex
+	last       time.Time
+	hasSession bool
+}
+
+// NewClient returns a Client with sensible defaults.
+func NewClient() *Client {
+	jar, _ := cookiejar.New(nil)
+	cfg := DefaultConfig()
+	return &Client{
+		cfg: cfg,
+		http: &http.Client{
+			Timeout: cfg.Timeout,
+			Jar:     jar,
+		},
+		jar: jar,
+	}
+}
+
+// NewClientFromConfig returns a Client configured with cfg.
+func NewClientFromConfig(cfg Config) *Client {
+	jar, _ := cookiejar.New(nil)
+	return &Client{
+		cfg: cfg,
+		http: &http.Client{
+			Timeout: cfg.Timeout,
+			Jar:     jar,
+		},
+		jar: jar,
+	}
+}
+
+// SetBaseURLs overrides base URLs for testing.
+func (c *Client) SetBaseURLs(xueqiuBase, stockBase string) {
+	c.cfg.XueqiuBase = xueqiuBase
+	c.cfg.StockBase = stockBase
+}
+
+// SetHasSession marks the client as already having a session (for testing).
+func (c *Client) SetHasSession(v bool) {
+	c.mu.Lock()
+	c.hasSession = v
+	c.mu.Unlock()
+}
+
+// pace waits until the minimum interval since the last request has elapsed.
+func (c *Client) pace() {
+	if c.cfg.Rate > 0 {
+		if elapsed := time.Since(c.last); elapsed < c.cfg.Rate {
+			time.Sleep(c.cfg.Rate - elapsed)
+		}
+	}
+	c.last = time.Now()
+}
+
+// bootstrap fetches the Xueqiu session cookie if not already obtained.
+// It visits /hq which triggers the server to set the required cookies.
+func (c *Client) bootstrap(ctx context.Context) error {
+	c.mu.Lock()
+	if c.hasSession {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	if _, err := c.rawGet(ctx, c.cfg.XueqiuBase+"/hq"); err != nil {
+		return fmt.Errorf("xueqiu session bootstrap: %w", err)
+	}
+
+	c.mu.Lock()
+	c.hasSession = true
+	c.mu.Unlock()
+	return nil
+}
+
+// --- API types ---
+
+// Post is one discussion post from the Xueqiu public timeline.
+type Post struct {
+	ID          int64  `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Author      string `json:"author"`
+	ReplyCount  int    `json:"reply_count"`
+	LikeCount   int    `json:"like_count"`
+	Category    int    `json:"category"`
+	URL         string `json:"url"`
+}
+
+// Quote is a real-time stock quote from Xueqiu.
+type Quote struct {
+	Symbol   string  `json:"symbol"`
+	Name     string  `json:"name"`
+	Current  float64 `json:"current"`
+	Percent  float64 `json:"percent"`
+	Chg      float64 `json:"chg"`
+	Open     float64 `json:"open"`
+	High     float64 `json:"high"`
+	Low      float64 `json:"low"`
+	Volume   int64   `json:"volume"`
+	Turnover float64 `json:"turnover"`
+}
+
+// timelineResponse is the outer envelope from /v4/statuses/public_timeline_by_category.json.
+type timelineResponse struct {
+	List      []timelineItem `json:"list"`
+	NextMaxID int64          `json:"next_max_id"`
+	NextID    int64          `json:"next_id"`
+}
+
+// timelineItem is one item in the timeline; its Data field is a JSON string.
+type timelineItem struct {
+	ID       int64  `json:"id"`
+	Category int    `json:"category"`
+	Data     string `json:"data"`
+}
+
+// postData is the inner JSON decoded from timelineItem.Data.
+type postData struct {
+	ID          int64  `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	ReplyCount  int    `json:"reply_count"`
+	LikeCount   int    `json:"like_count"`
+	User        struct {
+		ScreenName string `json:"screen_name"`
+	} `json:"user"`
+	Target string `json:"target"`
+}
+
+// quoteResponse is the envelope from /query/v1/suggest_stock.json.
+type quoteResponse struct {
+	Code    int         `json:"code"`
+	Data    []quoteData `json:"data"`
+	Message string      `json:"message"`
+	Success bool        `json:"success"`
+}
+
+// quoteData is one stock result from the suggest endpoint.
+type quoteData struct {
+	Code    string  `json:"code"`
+	Name    string  `json:"name"`
+	Current float64 `json:"current"`
+	Percent float64 `json:"percent"`
+	Chg     float64 `json:"chg"`
+	Open    float64 `json:"open"`
+	High    float64 `json:"high"`
+	Low     float64 `json:"low"`
+	Volume  int64   `json:"volume"`
+	Amount  float64 `json:"amount"`
+}
+
+// --- API methods ---
+
+// HotPosts fetches trending posts from the Xueqiu public timeline.
+func (c *Client) HotPosts(ctx context.Context, limit int) ([]Post, error) {
+	if err := c.bootstrap(ctx); err != nil {
+		return nil, err
+	}
+
+	count := limit
+	if count < 1 || count > 20 {
+		count = 20
+	}
+	u := fmt.Sprintf("%s/v4/statuses/public_timeline_by_category.json?since_id=-1&max_id=-1&count=%d&category=-1",
+		c.cfg.XueqiuBase, count)
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp timelineResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse timeline: %w", err)
+	}
+
+	var posts []Post
+	for _, item := range resp.List {
+		var pd postData
+		if err := json.Unmarshal([]byte(item.Data), &pd); err != nil {
+			continue // skip malformed items
+		}
+		postURL := ""
+		if pd.Target != "" {
+			postURL = c.cfg.XueqiuBase + pd.Target
+		} else {
+			postURL = fmt.Sprintf("%s/%d", c.cfg.XueqiuBase, pd.ID)
+		}
+		posts = append(posts, Post{
+			ID:          pd.ID,
+			Title:       pd.Title,
+			Description: pd.Description,
+			Author:      pd.User.ScreenName,
+			ReplyCount:  pd.ReplyCount,
+			LikeCount:   pd.LikeCount,
+			Category:    item.Category,
+			URL:         postURL,
+		})
+	}
+
+	if limit > 0 && limit < len(posts) {
+		posts = posts[:limit]
+	}
+	return posts, nil
+}
+
+// StockQuote fetches a real-time quote for the given symbol.
+// It uses the suggest_stock endpoint which is accessible with the session cookie.
+func (c *Client) StockQuote(ctx context.Context, symbol string) (*Quote, error) {
+	if err := c.bootstrap(ctx); err != nil {
+		return nil, err
+	}
+
+	u := fmt.Sprintf("%s/query/v1/suggest_stock.json?q=%s&size=1",
+		c.cfg.XueqiuBase, url.QueryEscape(symbol))
+
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp quoteResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse quote: %w", err)
+	}
+
+	if len(resp.Data) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, symbol)
+	}
+
+	d := resp.Data[0]
+	return &Quote{
+		Symbol:   d.Code,
+		Name:     d.Name,
+		Current:  d.Current,
+		Percent:  d.Percent,
+		Chg:      d.Chg,
+		Open:     d.Open,
+		High:     d.High,
+		Low:      d.Low,
+		Volume:   d.Volume,
+		Turnover: d.Amount,
+	}, nil
+}
+
+// --- internal HTTP helpers ---
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
+			wait := time.Duration(attempt) * 500 * time.Millisecond
+			if wait > 5*time.Second {
+				wait = 5 * time.Second
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
+			case <-time.After(wait):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		b, retry, err := c.doGet(ctx, rawURL)
 		if err == nil {
-			return body, nil
+			return b, nil
 		}
 		lastErr = err
 		if !retry {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+// rawGet is like get but without retry (used for bootstrap).
+func (c *Client) rawGet(ctx context.Context, rawURL string) ([]byte, error) {
+	b, _, err := c.doGet(ctx, rawURL)
+	return b, err
+}
+
+func (c *Client) doGet(ctx context.Context, rawURL string) ([]byte, bool, error) {
+	c.mu.Lock()
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	c.mu.Unlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json, text/html, */*")
+	req.Header.Set("Referer", "https://xueqiu.com/")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -97,104 +365,9 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
-func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
-	}
-	c.last = time.Now()
-}
-
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on xueqiu.com. It is a stand-in for the typed records you
-// will model from the real xueqiu endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `xue cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

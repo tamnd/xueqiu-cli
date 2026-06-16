@@ -1,126 +1,106 @@
+// Package xueqiu exposes the Xueqiu kit Domain.
 package xueqiu
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"errors"
+	"fmt"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes xueqiu as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/xueqiu-cli/xueqiu"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// xueqiu:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone xue binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the xueqiu driver. It carries no state; the per-run client is
+// Domain is the Xueqiu driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hosts, and identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "xueqiu",
-		Hosts:  []string{Host},
+		Hosts:  []string{Host, "www.xueqiu.com", "stock.xueqiu.com"},
 		Identity: kit.Identity{
 			Binary: "xue",
 			Short:  "Browse Xueqiu stock discussions and quotes",
-			Long: `Browse Xueqiu stock discussions and quotes
+			Long: `xue turns xueqiu.com into a fast, scriptable command line.
 
-xue reads public xueqiu data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Read trending investment discussions and real-time stock quotes from the public
+Xueqiu APIs. A session cookie is obtained automatically on first use, no account
+or API key required.
+
+Quick start:
+  xue hot                   top 10 trending posts
+  xue hot -n 20             top 20 posts
+  xue quote SH000001        Shanghai Composite Index
+  xue quote AAPL            Apple Inc
+  xue quote HK00700         Tencent Holdings
+  xue hot -o jsonl          posts as newline-delimited JSON`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/xueqiu-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and the xueqiu operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `xue page` and
-	// `ant get xueqiu://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "hot",
+		Group:   "posts",
+		Summary: "List trending posts and discussions on Xueqiu",
+	}, listHot)
 
-	// List op: members of a page, the home of `xue links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// xueqiu://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:     "quote",
+		Group:    "stocks",
+		Single:   true,
+		Summary:  "Fetch a real-time stock quote",
+		Args:     []kit.Arg{{Name: "symbol", Help: "stock symbol (e.g. SH000001, AAPL, HK00700)"}},
+	}, getQuote)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a Client from the resolved kit Config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.cfg.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type hotInput struct {
+	Limit  int     `kit:"flag,inherit" help:"max posts to show" default:"10"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type quoteInput struct {
+	Symbol string  `kit:"arg" help:"stock symbol (e.g. SH000001, AAPL)"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listHot(ctx context.Context, in hotInput, emit func(Post) error) error {
+	posts, err := in.Client.HotPosts(ctx, in.Limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
+	for _, p := range posts {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +108,44 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full xueqiu.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized xueqiu reference: %q", input)
+func getQuote(ctx context.Context, in quoteInput, emit func(*Quote) error) error {
+	if in.Symbol == "" {
+		return errs.Usage("xue quote: symbol is required")
 	}
-	return "page", id, nil
+	q, err := in.Client.StockQuote(ctx, in.Symbol)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(q)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// --- Resolver ---
+
+// Classify turns any input into the canonical (type, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("xueqiu: empty input")
+	}
+	return "stock", input, nil
+}
+
+// Locate returns the canonical URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "stock":
+		return fmt.Sprintf("https://xueqiu.com/S/%s", id), nil
+	default:
 		return "", errs.Usage("xueqiu has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts library errors to kit error types.
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
 	return err
 }
