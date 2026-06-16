@@ -1,0 +1,10 @@
+title       = "xue"
+baseURL     = "https://xueqiu-cli.tamnd.com/"
+description = "Browse Xueqiu stock discussions and quotes"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/xueqiu-cli"
