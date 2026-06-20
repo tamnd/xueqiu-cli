@@ -32,9 +32,13 @@ xueqiu reads public Xueqiu data over plain HTTPS, shapes it into clean records,
 and prints output that pipes into the rest of your tools. No API key required.
 
 Examples:
-  xueqiu hot               show top hot stocks
-  xueqiu quote SH600519    quote for Kweichow Moutai
-  xueqiu quote AAPL        quote for Apple Inc.`,
+  xueqiu hot                    show top hot stocks
+  xueqiu quote SH600519         quote for Kweichow Moutai
+  xueqiu kline SH600519         100-day OHLCV history
+  xueqiu stocks --market CN     list A-share stocks
+  xueqiu screener --pe-max 20   screen by PE ratio
+  xueqiu news SH600519          stock news feed
+  xueqiu comments SH600519      community posts about a stock`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/xueqiu-cli",
 		},
@@ -63,6 +67,49 @@ func (Domain) Register(app *kit.App) {
 		Resolver: true,
 		Args:     []kit.Arg{{Name: "symbol", Help: "stock symbol, e.g. SH600519 or AAPL"}},
 	}, getQuote)
+
+	// kline: OHLCV price history for a symbol.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "kline",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch OHLCV price history for a stock",
+		Args:    []kit.Arg{{Name: "symbol", Help: "stock symbol, e.g. SH600519 or AAPL"}},
+	}, listKline)
+
+	// stocks: paginated stock list for a market.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "stocks",
+		Group:   "read",
+		List:    true,
+		Summary: "List stocks for a market (CN, US, HK)",
+	}, listStocks)
+
+	// screener: filter stocks by fundamental criteria.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "screener",
+		Group:   "read",
+		List:    true,
+		Summary: "Screen stocks by market and PE ratio",
+	}, listScreener)
+
+	// news: stock-specific news and post timeline.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "news",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch the news/post timeline for a stock",
+		Args:    []kit.Arg{{Name: "symbol", Help: "stock symbol, e.g. SH600519"}},
+	}, listNews)
+
+	// comments: community posts mentioning a stock.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "comments",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch community posts mentioning a stock",
+		Args:    []kit.Arg{{Name: "symbol", Help: "stock symbol, e.g. SH600519"}},
+	}, listComments)
 }
 
 // newClient builds the client from the host-resolved config.
@@ -95,6 +142,40 @@ type quoteIn struct {
 	Client *Client `kit:"inject"`
 }
 
+type klineIn struct {
+	Symbol string  `kit:"arg"          help:"stock symbol, e.g. SH600519 or AAPL"`
+	Period string  `kit:"flag"         help:"candle period: day, week, month (default day)"`
+	Count  int     `kit:"flag"         help:"number of candles, negative = most recent (default -100)"`
+	Client *Client `kit:"inject"`
+}
+
+type stocksIn struct {
+	Market string  `kit:"flag"         help:"market: CN, US, HK (default CN)"`
+	Page   int     `kit:"flag"         help:"page number (default 1)"`
+	Client *Client `kit:"inject"`
+}
+
+type screenerIn struct {
+	Market string  `kit:"flag"         help:"market: CN, US, HK (default CN)"`
+	PeMin  float64 `kit:"flag"         help:"minimum PE ratio (TTM)"`
+	PeMax  float64 `kit:"flag"         help:"maximum PE ratio (TTM)"`
+	Page   int     `kit:"flag"         help:"page number (default 1)"`
+	Client *Client `kit:"inject"`
+}
+
+type newsIn struct {
+	Symbol string  `kit:"arg"          help:"stock symbol, e.g. SH600519"`
+	Count  int     `kit:"flag,inherit" help:"max results (default 15)"`
+	Client *Client `kit:"inject"`
+}
+
+type commentsIn struct {
+	Symbol string  `kit:"arg"          help:"stock symbol, e.g. SH600519"`
+	Count  int     `kit:"flag,inherit" help:"max results per page (default 15)"`
+	Page   int     `kit:"flag"         help:"page number (default 1)"`
+	Client *Client `kit:"inject"`
+}
+
 // --- handlers ---
 
 func listHot(ctx context.Context, in hotIn, emit func(*HotStock) error) error {
@@ -116,6 +197,71 @@ func getQuote(ctx context.Context, in quoteIn, emit func(*Quote) error) error {
 		return mapErr(err)
 	}
 	return emit(q)
+}
+
+func listKline(ctx context.Context, in klineIn, emit func(*Candle) error) error {
+	candles, err := in.Client.Kline(ctx, strings.ToUpper(in.Symbol), in.Period, in.Count)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, c := range candles {
+		if err := emit(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listStocks(ctx context.Context, in stocksIn, emit func(*Stock) error) error {
+	stocks, err := in.Client.Stocks(ctx, strings.ToUpper(in.Market), in.Page)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, s := range stocks {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listScreener(ctx context.Context, in screenerIn, emit func(*Stock) error) error {
+	stocks, err := in.Client.Screener(ctx, strings.ToUpper(in.Market), in.PeMin, in.PeMax, in.Page)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, s := range stocks {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listNews(ctx context.Context, in newsIn, emit func(*NewsItem) error) error {
+	items, err := in.Client.News(ctx, strings.ToUpper(in.Symbol), in.Count)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, it := range items {
+		if err := emit(it); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listComments(ctx context.Context, in commentsIn, emit func(*Comment) error) error {
+	items, err := in.Client.Comments(ctx, strings.ToUpper(in.Symbol), in.Count, in.Page)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, it := range items {
+		if err := emit(it); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // --- Resolver: pure string functions, network-free ---
